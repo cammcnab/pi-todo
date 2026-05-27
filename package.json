@@ -1,0 +1,39 @@
+{
+  "name": "pi-todo",
+  "version": "0.1.0",
+  "description": "Pi extension that syncs a /todo list with the 'pi' Apple Reminders list via AppleScript (no Swift helper, no TCC dance).",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cammcnab/pi-todo.git"
+  },
+  "homepage": "https://github.com/cammcnab/pi-todo",
+  "bugs": {
+    "url": "https://github.com/cammcnab/pi-todo/issues"
+  },
+  "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "todo",
+    "reminders",
+    "applescript",
+    "tui"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/todo.ts"
+    ]
+  }
+}
