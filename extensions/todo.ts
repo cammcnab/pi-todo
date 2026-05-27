@@ -34,6 +34,7 @@ interface Todo {
   body: string;
   done: boolean;
   priority: "none" | "low" | "medium" | "high";
+  dueDate: string | null;
 }
 
 interface TodoDetails {
@@ -44,25 +45,42 @@ interface TodoDetails {
 
 const PRIORITY_TO_APPLE: Record<string, number> = { none: 0, low: 9, medium: 5, high: 1 };
 const APPLE_TO_PRIORITY: Record<number, string> = { 0: "none", 9: "low", 5: "medium", 1: "high" };
+const PRIORITY_SORT_RANK: Record<Todo["priority"], number> = { high: 0, medium: 1, low: 2, none: 3 };
 
 // ─── JXA backend ──────────────────────────────────────────────────────────────
 //
-// Each helper is a tiny JavaScript-for-Automation script piped to osascript.
-// Reminders.app exposes `name`, `body`, `completed`, `priority`, `id` per
-// reminder. Priority values 0/9/5/1 match EventKit's none/low/medium/high.
+// Each helper is a tiny JavaScript-for-Automation script passed to osascript.
+// Reminders.app exposes `name`, `body`, `completed`, `priority`, `dueDate`,
+// and `id` per reminder. Priority values 0/9/5/1 match EventKit's none/low/medium/high.
 
 const JXA_LIST = `
 function run() {
   const R = Application('Reminders');
   let list = R.lists.whose({name:'pi'})[0];
   if (!list) { list = R.List({name:'pi'}); R.lists.push(list); }
-  return JSON.stringify(list.reminders().map(r => ({
-    id: r.id(),
-    title: r.name() || '',
-    body: r.body() || '',
-    done: r.completed(),
-    priority: r.priority(),
-  })));
+
+  // JXA is painfully slow when reading each reminder property one item at a
+  // time (and can exceed Pi's command timeout with ~50 reminders). Pull each
+  // property as a batch from Reminders, then zip the arrays in-process.
+  const names = list.reminders.name();
+  const bodies = list.reminders.body();
+  const completed = list.reminders.completed();
+  const priorities = list.reminders.priority();
+  const dueDates = list.reminders.dueDate();
+  const ids = list.reminders.id();
+
+  const reminders = [];
+  for (let i = 0; i < ids.length; i++) {
+    reminders.push({
+      id: ids[i] || '',
+      title: names[i] || '',
+      body: bodies[i] || '',
+      done: !!completed[i],
+      priority: priorities[i] || 0,
+      dueDate: dueDates[i] || null,
+    });
+  }
+  return JSON.stringify(reminders);
 }
 `;
 
@@ -80,6 +98,7 @@ function run(argv) {
     body: r.body() || '',
     done: r.completed(),
     priority: r.priority(),
+    dueDate: r.dueDate(),
   });
 }
 `;
@@ -96,6 +115,7 @@ function run(argv) {
     body: r.body() || '',
     done: r.completed(),
     priority: r.priority(),
+    dueDate: r.dueDate(),
   });
 }
 `;
@@ -116,6 +136,7 @@ function run(argv) {
     body: r.body() || '',
     done: r.completed(),
     priority: r.priority(),
+    dueDate: r.dueDate(),
   });
 }
 `;
@@ -143,13 +164,27 @@ function run() {
 `;
 
 async function osascriptJXA(script: string, args: string[] = []): Promise<string> {
-  // -l JavaScript = JXA, - = read script from stdin, then -- passes argv to run()
-  const { stdout } = await execFileAsync(
-    "/usr/bin/osascript",
-    ["-l", "JavaScript", "-", ...args],
-    { input: script, encoding: "utf8", timeout: 15000 } as any,
-  );
-  return stdout.trim();
+  // Route through /bin/bash so TCC attributes the AppleEvent to the bash
+  // subshell rather than to Pi directly. With Pi as the immediate parent,
+  // macOS denies the Reminders AppleEvent silently; via an interposing bash
+  // shell, attribution walks up to Pi's app bundle and succeeds.
+  try {
+    const { stdout } = await execFileAsync(
+      "/bin/bash",
+      ["-c", '/usr/bin/osascript -l JavaScript -e "$JXA_SCRIPT" "$@"', "osascript-jxa", ...args],
+      {
+        encoding: "utf8",
+        timeout: 45000,
+        env: { ...process.env, JXA_SCRIPT: script },
+      } as any,
+    );
+    return stdout.trim();
+  } catch (err: any) {
+    const stderr = err?.stderr ?? "";
+    const stdout = err?.stdout ?? "";
+    const code = err?.code ?? "?";
+    throw new Error(`osascript exit=${code} stderr=${String(stderr).trim()} stdout=${String(stdout).trim()}`);
+  }
 }
 
 function parseTodo(raw: any): Todo {
@@ -159,12 +194,54 @@ function parseTodo(raw: any): Todo {
     body: raw.body ?? "",
     done: !!raw.done,
     priority: (APPLE_TO_PRIORITY[raw.priority] || "none") as Todo["priority"],
+    dueDate: raw.dueDate ? new Date(raw.dueDate).toISOString() : null,
   };
+}
+
+function dueTime(todo: Todo): number {
+  if (!todo.dueDate) return Number.POSITIVE_INFINITY;
+  const time = new Date(todo.dueDate).getTime();
+  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+}
+
+function compareTodos(a: Todo, b: Todo): number {
+  // Match Reminders' useful default for Cam: open work first, then priority.
+  // Within each priority tier, dated reminders come first and sort by due date.
+  if (a.done !== b.done) return a.done ? 1 : -1;
+
+  const priorityDiff = PRIORITY_SORT_RANK[a.priority] - PRIORITY_SORT_RANK[b.priority];
+  if (priorityDiff !== 0) return priorityDiff;
+
+  const aHasDue = !!a.dueDate;
+  const bHasDue = !!b.dueDate;
+  if (aHasDue !== bHasDue) return aHasDue ? -1 : 1;
+
+  const dueDiff = dueTime(a) - dueTime(b);
+  if (dueDiff !== 0) return dueDiff;
+
+  return a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
+}
+
+function sortTodos(input: Todo[]): Todo[] {
+  return [...input].sort(compareTodos);
+}
+
+function formatDueDate(dueDate: string | null): string {
+  if (!dueDate) return "";
+  const date = new Date(dueDate);
+  if (!Number.isFinite(date.getTime())) return "";
+  const now = new Date();
+  const includeYear = date.getFullYear() !== now.getFullYear();
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(includeYear ? { year: "numeric" as const } : {}),
+  });
 }
 
 async function fetchReminders(): Promise<Todo[]> {
   const out = await osascriptJXA(JXA_LIST);
-  return (JSON.parse(out) as any[]).map(parseTodo);
+  return sortTodos((JSON.parse(out) as any[]).map(parseTodo));
 }
 
 async function addReminder(title: string, body: string, priority: Todo["priority"]): Promise<Todo> {
@@ -230,6 +307,7 @@ function createTodoListUI(
   let cachedLines: string[] | undefined;
   let scrollOffset = 0;
   let syncing = false;
+  let syncError: string | undefined;
 
   let newTitle = "";
   let newBody = "";
@@ -257,8 +335,10 @@ function createTodoListUI(
     syncing = true;
     refresh();
     try {
+      syncError = undefined;
       todos = await syncFn();
-    } catch {
+    } catch (err: any) {
+      syncError = err?.message ? String(err.message) : String(err);
       /* keep local */
     }
     if (selectedIndex >= todos.length) selectedIndex = Math.max(0, todos.length - 1);
@@ -277,6 +357,27 @@ function createTodoListUI(
       default:
         return "";
     }
+  }
+
+  function sortAndSelect(id?: string) {
+    todos = sortTodos(todos);
+    if (id) {
+      selectedIndex = todos.findIndex((t) => t.id === id);
+      if (selectedIndex !== -1) return;
+    }
+    if (selectedIndex >= todos.length) selectedIndex = Math.max(0, todos.length - 1);
+  }
+
+  function optimisticToggle(todo: Todo) {
+    const previous = todo.done;
+    todo.done = !todo.done;
+    sortAndSelect(todo.id);
+    refresh();
+    toggleReminder(todo.id).catch(() => {
+      todo.done = previous;
+      sortAndSelect(todo.id);
+      refresh();
+    });
   }
 
   function handleInput(data: string) {
@@ -355,14 +456,7 @@ function createTodoListUI(
       }
       if (matchesKey(data, Key.space) || matchesKey(data, Key.enter) || matchesKey(data, "x")) {
         const todo = todos[selectedIndex];
-        if (todo) {
-          todo.done = !todo.done;
-          refresh();
-          toggleReminder(todo.id).catch(() => {
-            todo.done = !todo.done;
-            refresh();
-          });
-        }
+        if (todo) optimisticToggle(todo);
         return;
       }
       if (matchesKey(data, "d") || matchesKey(data, Key.delete) || matchesKey(data, Key.backspace)) {
@@ -407,14 +501,7 @@ function createTodoListUI(
     }
     if (matchesKey(data, Key.space) || matchesKey(data, "x")) {
       const todo = todos[selectedIndex];
-      if (todo) {
-        todo.done = !todo.done;
-        refresh();
-        toggleReminder(todo.id).catch(() => {
-          todo.done = !todo.done;
-          refresh();
-        });
-      }
+      if (todo) optimisticToggle(todo);
       return;
     }
     if (matchesKey(data, "a")) {
@@ -444,9 +531,9 @@ function createTodoListUI(
   function doAdd() {
     const title = newTitle;
     const body = newBody;
-    const placeholder: Todo = { id: "__pending__", title, body, done: false, priority: "none" };
+    const placeholder: Todo = { id: "__pending__", title, body, done: false, priority: "none", dueDate: null };
     todos.push(placeholder);
-    selectedIndex = todos.length - 1;
+    sortAndSelect(placeholder.id);
     mode = "list";
     refresh();
 
@@ -454,6 +541,7 @@ function createTodoListUI(
       .then((real) => {
         const idx = todos.indexOf(placeholder);
         if (idx !== -1) todos[idx] = real;
+        sortAndSelect(real.id);
         refresh();
       })
       .catch(() => {
@@ -473,7 +561,7 @@ function createTodoListUI(
     if (syncing) {
       add(separator);
       add("");
-      add(theme.fg("accent", "  ⟳ Syncing with Apple Reminders..."));
+      add(theme.fg("accent", "  ⟳  Syncing with Apple Reminders..."));
       add("");
       add(separator);
       cachedLines = lines;
@@ -542,6 +630,9 @@ function createTodoListUI(
       if (todo.priority !== "none") {
         add(theme.fg("muted", `  Priority: `) + theme.fg("text", todo.priority));
       }
+      if (todo.dueDate) {
+        add(theme.fg("muted", `  Due: `) + theme.fg("text", formatDueDate(todo.dueDate)));
+      }
       add(
         theme.fg("muted", `  Status: `) +
           (todo.done ? theme.fg("success", "completed") : theme.fg("text", "open")),
@@ -572,6 +663,11 @@ function createTodoListUI(
     add(titleLine);
     add("");
 
+    if (syncError) {
+      add(theme.fg("error", `  Sync failed: ${syncError}`));
+      add("");
+    }
+
     if (todos.length === 0) {
       add(theme.fg("dim", "  No todos yet."));
       add(theme.fg("dim", "  Press a to add one, or r to refresh from Reminders."));
@@ -592,10 +688,11 @@ function createTodoListUI(
         const titleColor = todo.done ? "dim" : isSelected ? "accent" : "text";
         const titleStr = theme.fg(titleColor, todo.title);
         const pBadge = priorityBadge(todo.priority);
+        const dueBadge = todo.dueDate ? theme.fg("accent", ` due ${formatDueDate(todo.dueDate)}`) : "";
         const bodyHint = todo.body ? theme.fg("dim", " …") : "";
         add(
           truncateToWidth(
-            `${prefix}${check}${titleStr}${pBadge ? " " + pBadge : ""}${bodyHint}`,
+            `${prefix}${check}${titleStr}${pBadge ? " " + pBadge : ""}${dueBadge}${bodyHint}`,
             width,
           ),
         );
@@ -614,6 +711,8 @@ function createTodoListUI(
     return lines;
   }
 
+  void sync();
+
   return {
     render,
     invalidate: () => {
@@ -628,20 +727,21 @@ function createTodoListUI(
 export default function (pi: ExtensionAPI) {
   let todos: Todo[] = [];
 
-  async function syncFromReminders(): Promise<Todo[]> {
+  async function syncFromReminders(options: { silent?: boolean } = {}): Promise<Todo[]> {
     try {
       todos = await fetchReminders();
-    } catch {
+    } catch (err) {
+      if (!options.silent) throw err;
       /* keep local */
     }
     return todos;
   }
 
   pi.on("session_start", async () => {
-    syncFromReminders();
+    void syncFromReminders({ silent: true });
   });
   pi.on("session_switch", async () => {
-    syncFromReminders();
+    void syncFromReminders({ silent: true });
   });
 
   pi.registerTool({
@@ -674,6 +774,7 @@ export default function (pi: ExtensionAPI) {
                 .map((t) => {
                   let line = `  ○ ${t.title} (id: ${t.id})`;
                   if (t.priority !== "none") line += ` [${t.priority}]`;
+                  if (t.dueDate) line += ` (due: ${formatDueDate(t.dueDate)})`;
                   if (t.body) line += `\n    ${t.body.split("\n").join("\n    ")}`;
                   return line;
                 })
@@ -702,7 +803,7 @@ export default function (pi: ExtensionAPI) {
             params.body || "",
             (params.priority as Todo["priority"]) || "none",
           );
-          todos.push(newTodo);
+          todos = sortTodos([...todos, newTodo]);
           return {
             content: [
               {
@@ -729,6 +830,8 @@ export default function (pi: ExtensionAPI) {
           }
           const toggled = await toggleReminder(todo.id);
           todo.done = toggled.done;
+          todo.dueDate = toggled.dueDate;
+          todos = sortTodos(todos);
           return {
             content: [
               {
@@ -761,6 +864,8 @@ export default function (pi: ExtensionAPI) {
           todo.title = updated.title;
           todo.body = updated.body;
           todo.priority = updated.priority;
+          todo.dueDate = updated.dueDate;
+          todos = sortTodos(todos);
           return {
             content: [{ type: "text", text: `Updated todo: ${todo.title} (id: ${todo.id})` }],
             details: { action: "edit", todos: [...todos] } as TodoDetails,
@@ -878,8 +983,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("/todo requires interactive mode", "error");
         return;
       }
-      await syncFromReminders();
-      await ctx.ui.custom<void>((tui: any, theme: any, _kb: any, done: any) => {
+      await ctx.ui.custom((tui: any, theme: any, _kb: any, done: any) => {
         return createTodoListUI(todos, theme, tui, done, syncFromReminders);
       });
     },
